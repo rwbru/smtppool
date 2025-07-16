@@ -4,6 +4,7 @@ package smtppool
 
 import (
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"net/smtp"
 	"net/textproto"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -444,23 +446,57 @@ func (c *conn) mailFromNoESMTP(from string) error {
 }
 
 // Start starts the SMTP LOGIN auth type.
-// https://gist.github.com/andelf/5118732
 func (a *LoginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
 	return "LOGIN", []byte{}, nil
 }
 
-// Next passes the credentials for SMTP LOGIN auth type.
+// Next handles the LOGIN auth challenge/response sequence.
+// It supports both plain text and base64-encoded server challenges.
 func (a *LoginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
 	if !more {
 		return nil, nil
 	}
-	switch string(fromServer) {
-	case "Username:":
+
+	// Convert to string for processing
+	challenge := string(fromServer)
+	
+	// Try to decode the server challenge as base64
+	var decodedChallenge string
+	if decoded, err := base64.StdEncoding.DecodeString(challenge); err == nil {
+		// Successfully decoded base64
+		decodedChallenge = string(decoded)
+	} else {
+		// Not base64, use as plain text
+		decodedChallenge = challenge
+	}
+
+	// Normalize the challenge for comparison
+	normalizedChallenge := strings.ToLower(strings.TrimSpace(decodedChallenge))
+	
+	// Handle various username prompts
+	if strings.Contains(normalizedChallenge, "username") || 
+	   strings.Contains(normalizedChallenge, "user") ||
+	   normalizedChallenge == "334 VXNlcm5hbWU6" || // Base64 encoded "Username:" with SMTP code
+	   challenge == "VXNlcm5hbWU6" { // Direct base64 "Username:"
 		return []byte(a.Username), nil
-	case "Password:":
+	}
+	
+	// Handle various password prompts
+	if strings.Contains(normalizedChallenge, "password") || 
+	   strings.Contains(normalizedChallenge, "pass") ||
+	   normalizedChallenge == "334 UGFzc3dvcmQ6" || // Base64 encoded "Password:" with SMTP code
+	   challenge == "UGFzc3dvcmQ6" { // Direct base64 "Password:"
+		return []byte(a.Password), nil
+	}
+
+	// Fallback for exact matches (original behavior)
+	switch decodedChallenge {
+	case "Username:", "username:", "User:", "user:":
+		return []byte(a.Username), nil
+	case "Password:", "password:", "Pass:", "pass:":
 		return []byte(a.Password), nil
 	default:
-		return nil, errors.New("unkown SMTP fromServer")
+		return nil, errors.New("unknown SMTP LOGIN challenge: '" + challenge + "' (decoded: '" + decodedChallenge + "')")
 	}
 }
 
