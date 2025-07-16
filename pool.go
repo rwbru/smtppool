@@ -10,6 +10,7 @@ import (
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
+	"reflect"
 	"sync/atomic"
 	"time"
 )
@@ -54,6 +55,11 @@ type Opt struct {
 
 	// TLSConfig is the optional TLS configuration.
 	TLSConfig *tls.Config
+
+	// DisableESMTP disables ESMTP extension parameters in MAIL FROM command.
+	// This is useful for servers that advertise ESMTP support but reject
+	// ESMTP parameters (like some Exchange servers).
+	DisableESMTP bool `json:"disable_esmtp"`
 }
 
 // Pool represents an SMTP connection pool.
@@ -126,7 +132,7 @@ func (p *Pool) Send(e Email) error {
 		}
 
 		// Send the message.
-		canRetry, err := c.send(e)
+		canRetry, err := c.send(e, p.opt)
 		if err == nil {
 			_ = p.returnConn(c, nil)
 			return nil
@@ -342,7 +348,7 @@ func (p *Pool) sweepConns(interval time.Duration) {
 
 // send sends a message using the connection. The bool in the return indicates
 // if the message can be retried in case of an SMTP related error.
-func (c *conn) send(e Email) (bool, error) {
+func (c *conn) send(e Email, opt Opt) (bool, error) {
 	c.lastActivity = time.Now()
 
 	// Combine e-mail addresses from multiple lists.
@@ -358,8 +364,16 @@ func (c *conn) send(e Email) (bool, error) {
 	}
 
 	// Send the Mail command.
-	if err = c.conn.Mail(from); err != nil {
-		return false, err
+	if opt.DisableESMTP {
+		// Send MAIL FROM without ESMTP parameters for Exchange compatibility
+		if err = c.mailFromNoESMTP(from); err != nil {
+			return false, err
+		}
+	} else {
+		// Use standard SMTP client Mail() method
+		if err = c.conn.Mail(from); err != nil {
+			return false, err
+		}
 	}
 
 	// Send RCPT for all receipients.
@@ -398,6 +412,35 @@ func (c *conn) send(e Email) (bool, error) {
 	isClosed = true
 
 	return false, nil
+}
+
+// mailFromNoESMTP sends a MAIL FROM command without ESMTP parameters.
+// This is useful for servers that advertise ESMTP support but reject
+// ESMTP parameters (like some Exchange servers).
+func (c *conn) mailFromNoESMTP(from string) error {
+	// Use reflection to access the underlying textproto.Conn from smtp.Client
+	clientValue := reflect.ValueOf(c.conn).Elem()
+	textField := clientValue.FieldByName("Text")
+	
+	if !textField.IsValid() {
+		return errors.New("failed to access underlying textproto connection")
+	}
+	
+	// Get the textproto.Conn
+	textConn := textField.Interface().(*textproto.Conn)
+	
+	// Send the MAIL FROM command without ESMTP parameters
+	cmd := fmt.Sprintf("MAIL FROM:<%s>", from)
+	if err := textConn.PrintfLine(cmd); err != nil {
+		return err
+	}
+	
+	// Read the response
+	if _, _, err := textConn.ReadResponse(250); err != nil {
+		return err
+	}
+	
+	return nil
 }
 
 // Start starts the SMTP LOGIN auth type.
